@@ -60,6 +60,7 @@ typedef enum {
   KEY_INPUT_FILE,
   KEY_OUTPUT_FILE,
   KEY_LOG_FILE,
+  KEY_CSV_FILE,
   KEY_PRESET,
   KEY_MODE = 'm',
   KEY_ERR_MODE = 'e',
@@ -75,6 +76,7 @@ static const char key_range_b64_str[] = "range-binary64";
 static const char key_input_file_str[] = "prec-input-file";
 static const char key_output_file_str[] = "prec-output-file";
 static const char key_log_file_str[] = "prec-log-file";
+static const char key_csv_file_str[] = "prec-csv-file";
 static const char key_preset_str[] = "preset";
 static const char key_mode_str[] = "mode";
 static const char key_err_mode_str[] = "error-mode";
@@ -205,9 +207,14 @@ typedef enum {
 
 static const char *vprec_input_file = NULL;
 static const char *vprec_output_file = NULL;
+static const char *vprec_csv = NULL;
+static const char *vprec_csv_callpath = NULL;
 static FILE *vprec_log_file = NULL;
+static FILE *vprec_csv_file = NULL;
+static FILE *vprec_csv_callpath_file = NULL;
 static vprec_inst_mode VPREC_INST_MODE = VPREC_INST_MODE_DEFAULT;
 static size_t vprec_log_depth = 0;
+static int vtid = 0;
 
 /* instrumentation modes' names */
 static const char *VPREC_INST_MODE_STR[] = {"arguments", "operations", "all",
@@ -296,6 +303,48 @@ void _set_vprec_log_file(const char *log_file) {
 
   if (vprec_log_file == NULL) {
     logger_error("Log file can't be written");
+  }
+}
+
+#define _vprec_print_csv(_vprec_csv_file, _vprec_str, ...)                     \
+  ({                                                                           \
+    if (_vprec_csv_file != NULL) {                                             \
+      fprintf(_vprec_csv_file, _vprec_str, ##__VA_ARGS__);                     \
+    }                                                                          \
+  })
+
+void _set_vprec_csv_file(const char *csv_file) {
+  vprec_csv = csv_file;
+  vprec_csv_file = fopen(csv_file, "w");
+
+  if (vprec_csv_file == NULL) {
+    logger_error("CSV file can't be written");
+  }
+  _vprec_print_csv(vprec_csv_file,
+                   "vid;depth;enter_exit;inbound_outbound;type;var_name;val_"
+                   "before;val_after;exponent_len;mantissa_len\n");
+  const char *point;
+  point = csv_file + strlen(csv_file);
+  if ((point = strrchr(csv_file, '.')) != NULL) {
+    if (strcmp(point, ".csv") == 0) {
+      const char *start = &csv_file[0];
+      const char *end = &csv_file[strlen(csv_file) - 4];
+      char *callpath_prefix = (char *)calloc(1, end - start + 1);
+      memcpy(callpath_prefix, start, end - start);
+      char callpath_str[500];
+      strcpy(callpath_str, callpath_prefix);
+      strcat(callpath_str, "_callpath.csv");
+      vprec_csv_callpath_file = fopen(callpath_str, "w");
+      if (vprec_csv_callpath_file == NULL) {
+        logger_error("CSV callpath file can't be written");
+      }
+      vprec_csv_callpath = malloc(strlen(callpath_str) + 1);
+      vprec_csv_callpath = (const char *)callpath_str;
+      _vprec_print_csv(vprec_csv_callpath_file,
+                       "vid;callpath;isLibFunc;isIntrinsic;useFloat;useDouble;"
+                       "opsPrec64;opsRange64;opsPrec32;opsRange32;nb_input_"
+                       "args;nb_output_args;n_calls\n");
+    }
   }
 }
 
@@ -646,7 +695,7 @@ vfc_hashmap_t _vprec_func_map;
 // Metadata of arguments
 typedef struct _vprec_argument_data {
   // Identifier of the argument
-  char arg_id[100];
+  char arg_id[5000];
   // Data type of the argument 0 is float and 1 is double
   short data_type;
   // Minimum rounded value of the argument
@@ -662,7 +711,9 @@ typedef struct _vprec_argument_data {
 // Metadata of function calls
 typedef struct _vprec_inst_function {
   // Id of the function
-  char id[500];
+  char id[5000];
+  // Virtual id of the function
+  int vid;
   // Indicate if the function is from library
   short isLibraryFunction;
   // Indicate if the function is intrinsic
@@ -692,37 +743,51 @@ typedef struct _vprec_inst_function {
 } _vprec_inst_function_t;
 
 // Write the hashmap in the given file
-void _vprec_write_hasmap(FILE *fout) {
-  for (size_t ii = 0; ii < _vprec_func_map->capacity; ii++) {
+void _vprec_write_hasmap(FILE *fout, FILE *vprec_callpath) {
+  for (int ii = 0; ii < _vprec_func_map->capacity; ii++) {
     if (get_value_at(_vprec_func_map->items, ii) != 0 &&
         get_value_at(_vprec_func_map->items, ii) != 0) {
       _vprec_inst_function_t *function =
           (_vprec_inst_function_t *)get_value_at(_vprec_func_map->items, ii);
-
-      fprintf(fout, "%s\t%hd\t%hd\t%zu\t%zu\t%d\t%d\t%d\t%d\t%d\t%d\t%d\n",
-              function->id, function->isLibraryFunction,
-              function->isIntrinsicFunction, function->useFloat,
-              function->useDouble, function->OpsPrec64, function->OpsRange64,
-              function->OpsPrec32, function->OpsRange32,
-              function->nb_input_args, function->nb_output_args,
-              function->n_calls);
+      if (fout != NULL) {
+        fprintf(fout, "%s\t%hd\t%hd\t%zu\t%zu\t%d\t%d\t%d\t%d\t%d\t%d\t%d\n",
+                function->id, function->isLibraryFunction,
+                function->isIntrinsicFunction, function->useFloat,
+                function->useDouble, function->OpsPrec64, function->OpsRange64,
+                function->OpsPrec32, function->OpsRange32,
+                function->nb_input_args, function->nb_output_args,
+                function->n_calls);
+      }
+      if (vprec_csv != NULL) {
+        _vprec_print_csv(
+            vprec_callpath, "%i;%s;%i;%i;%lu;%lu;%i;%i;%i;%i;%i;%i;%i\n",
+            function->vid, function->id, function->isLibraryFunction,
+            function->isIntrinsicFunction, function->useFloat,
+            function->useDouble, function->OpsPrec64, function->OpsRange64,
+            function->OpsPrec32, function->OpsRange32, function->nb_input_args,
+            function->nb_output_args, function->n_calls);
+      }
       for (int i = 0; i < function->nb_input_args; i++) {
-        fprintf(fout, "input:\t%s\t%hd\t%d\t%d\t%d\t%d\n",
-                function->input_args[i].arg_id,
-                function->input_args[i].data_type,
-                function->input_args[i].mantissa_length,
-                function->input_args[i].exponent_length,
-                function->input_args[i].min_range,
-                function->input_args[i].max_range);
+        if (fout != NULL) {
+          fprintf(fout, "input:\t%s\t%hd\t%d\t%d\t%d\t%d\n",
+                  function->input_args[i].arg_id,
+                  function->input_args[i].data_type,
+                  function->input_args[i].mantissa_length,
+                  function->input_args[i].exponent_length,
+                  function->input_args[i].min_range,
+                  function->input_args[i].max_range);
+        }
       }
       for (int i = 0; i < function->nb_output_args; i++) {
-        fprintf(fout, "output:\t%s\t%hd\t%d\t%d\t%d\t%d\n",
-                function->output_args[i].arg_id,
-                function->output_args[i].data_type,
-                function->output_args[i].mantissa_length,
-                function->output_args[i].exponent_length,
-                function->output_args[i].min_range,
-                function->output_args[i].max_range);
+        if (fout != NULL) {
+          fprintf(fout, "output:\t%s\t%hd\t%d\t%d\t%d\t%d\n",
+                  function->output_args[i].arg_id,
+                  function->output_args[i].data_type,
+                  function->output_args[i].mantissa_length,
+                  function->output_args[i].exponent_length,
+                  function->output_args[i].min_range,
+                  function->output_args[i].max_range);
+        }
       }
     }
   }
@@ -775,6 +840,7 @@ void _vprec_read_hasmap(FILE *fin) {
     // insert in the hashmap
     _vprec_inst_function_t *address = malloc(sizeof(_vprec_inst_function_t));
     (*address) = function;
+    function.vid = ++vtid;
     vfc_hashmap_insert(_vprec_func_map, vfc_hashmap_str_function(function.id),
                        address);
   }
@@ -812,15 +878,16 @@ void _interflop_enter_function(interflop_function_stack_t *stack, void *context,
     function_inst->isIntrinsicFunction = function_info->isIntrinsicFunction;
     function_inst->useFloat = function_info->useFloat;
     function_inst->useDouble = function_info->useDouble;
-    function_inst->OpsRange64 = VPREC_RANGE_BINARY64_DEFAULT;
-    function_inst->OpsPrec64 = VPREC_PRECISION_BINARY64_DEFAULT;
-    function_inst->OpsRange32 = VPREC_RANGE_BINARY32_DEFAULT;
-    function_inst->OpsPrec32 = VPREC_PRECISION_BINARY32_DEFAULT;
+    function_inst->OpsRange64 = VPRECLIB_BINARY64_RANGE;
+    function_inst->OpsPrec64 = VPRECLIB_BINARY64_PRECISION;
+    function_inst->OpsRange32 = VPRECLIB_BINARY32_RANGE;
+    function_inst->OpsPrec32 = VPRECLIB_BINARY32_PRECISION;
     function_inst->nb_input_args = 0;
     function_inst->input_args = NULL;
     function_inst->nb_output_args = 0;
     function_inst->output_args = NULL;
     function_inst->n_calls = 0;
+    function_inst->vid = ++vtid;
 
     // insert the function in the hashmap
     vfc_hashmap_insert(_vprec_func_map,
@@ -878,17 +945,18 @@ void _interflop_enter_function(interflop_function_stack_t *stack, void *context,
       function_inst->input_args[i].min_range = INT_MAX;
       function_inst->input_args[i].max_range = INT_MIN;
       function_inst->input_args[i].exponent_length =
-          (type == FDOUBLE || type == FDOUBLE_PTR)
-              ? VPREC_RANGE_BINARY64_DEFAULT
-              : VPREC_RANGE_BINARY32_DEFAULT;
+          (type == FDOUBLE || type == FDOUBLE_PTR) ? function_inst->OpsRange64
+                                                   : function_inst->OpsRange32;
       function_inst->input_args[i].mantissa_length =
-          (type == FDOUBLE || type == FDOUBLE_PTR)
-              ? VPREC_PRECISION_BINARY64_DEFAULT
-              : VPREC_PRECISION_BINARY32_DEFAULT;
+          (type == FDOUBLE || type == FDOUBLE_PTR) ? function_inst->OpsPrec64
+                                                   : function_inst->OpsPrec32;
     }
 
     if (type == FDOUBLE) {
       double *value = va_arg(ap, double *);
+      char data[sizeof(value)];
+      memcpy(data, &value, sizeof(data));
+      double value_orig = (double)atof(data);
 
       _vprec_print_log(vprec_log_depth, " - %s\tinput\tdouble\t%s\t%la\t->\t",
                        function_inst->id, arg_id, *value);
@@ -914,8 +982,20 @@ void _interflop_enter_function(interflop_function_stack_t *stack, void *context,
                        function_inst->input_args[i].mantissa_length,
                        function_inst->input_args[i].exponent_length);
 
+      if (vprec_csv != NULL) {
+        if (*value != value_orig) {
+          _vprec_print_csv(vprec_csv_file, "%i;%lu;1;%i;%i;%s;%la;%la;%d;%d\n",
+                           function_inst->vid, vprec_log_depth, VPRECLIB_MODE,
+                           type, arg_id, value_orig, *value,
+                           function_inst->input_args[i].mantissa_length,
+                           function_inst->input_args[i].exponent_length);
+        }
+      }
     } else if (type == FFLOAT) {
       float *value = va_arg(ap, float *);
+      char data[sizeof(value)];
+      memcpy(data, &value, sizeof(data));
+      float value_orig = (float)atof(data);
 
       _vprec_print_log(vprec_log_depth, " - %s\tinput\tfloat\t%s\t%a\t->\t",
                        function_inst->id, arg_id, *value);
@@ -942,8 +1022,20 @@ void _interflop_enter_function(interflop_function_stack_t *stack, void *context,
                        function_inst->input_args[i].mantissa_length,
                        function_inst->input_args[i].exponent_length);
 
+      if (vprec_csv != NULL) {
+        if (*value != value_orig) {
+          _vprec_print_csv(vprec_csv_file, "%i;%lu;1;%i;%i;%s;%a;%a;%d;%d\n",
+                           function_inst->vid, vprec_log_depth, VPRECLIB_MODE,
+                           type, arg_id, value_orig, *value,
+                           function_inst->input_args[i].mantissa_length,
+                           function_inst->input_args[i].exponent_length);
+        }
+      }
     } else if (type == FDOUBLE_PTR) {
       double *value = va_arg(ap, double *);
+      char data[sizeof(value)];
+      memcpy(data, &value, sizeof(data));
+      double value_orig = (double)atof(data);
 
       for (unsigned int j = 0; j < size; j++, value++) {
         if (value == NULL) {
@@ -979,15 +1071,33 @@ void _interflop_enter_function(interflop_function_stack_t *stack, void *context,
         _vprec_print_log(vprec_log_depth, "%la\t(%d, %d)\n", *value,
                          function_inst->input_args[i].mantissa_length,
                          function_inst->input_args[i].exponent_length);
+        if (vprec_csv != NULL) {
+          if (*value != value_orig) {
+            _vprec_print_csv(vprec_csv_file,
+                             "%i;%lu;1;%i;%i;%s;%la;%la;%d;%d\n",
+                             function_inst->vid, vprec_log_depth, VPRECLIB_MODE,
+                             type, arg_id, value_orig, *value,
+                             function_inst->input_args[i].mantissa_length,
+                             function_inst->input_args[i].exponent_length);
+          }
+        }
       }
     } else if (type == FFLOAT_PTR) {
       float *value = va_arg(ap, float *);
+      char data[sizeof(value)];
+      memcpy(data, &value, sizeof(data));
+      float value_orig = (float)atof(data);
 
       for (unsigned int j = 0; j < size; j++, value++) {
         if (value == NULL) {
           _vprec_print_log(vprec_log_depth,
                            " - %s\tinput[%u]\tfloat_ptr\t%s\tNULL\t->\tNULL\n",
                            function_inst->id, j, arg_id);
+          if (vprec_csv != NULL) {
+            _vprec_print_csv(vprec_csv_file, "%i;%lu;1;%i;%i;%s;NULL;NULL\n",
+                             function_inst->vid, vprec_log_depth, VPRECLIB_MODE,
+                             type, arg_id);
+          }
           continue;
         }
 
@@ -1017,6 +1127,16 @@ void _interflop_enter_function(interflop_function_stack_t *stack, void *context,
         _vprec_print_log(vprec_log_depth, "%a\t(%d, %d)\n", *value,
                          function_inst->input_args[i].mantissa_length,
                          function_inst->input_args[i].exponent_length);
+
+        if (vprec_csv != NULL) {
+          if (*value != value_orig) {
+            _vprec_print_csv(vprec_csv_file, "%i;%lu;1;%i;%i;%s;%a;%a;%d;%d\n",
+                             function_inst->vid, vprec_log_depth, VPRECLIB_MODE,
+                             type, arg_id, value_orig, *value,
+                             function_inst->input_args[i].mantissa_length,
+                             function_inst->input_args[i].exponent_length);
+          }
+        }
       }
     }
   }
@@ -1092,19 +1212,20 @@ void _interflop_exit_function(interflop_function_stack_t *stack, void *context,
       function_inst->output_args[i].data_type = type;
       strcpy(function_inst->output_args[i].arg_id, arg_id);
       function_inst->output_args[i].exponent_length =
-          (type == FDOUBLE || type == FDOUBLE_PTR)
-              ? VPREC_RANGE_BINARY64_DEFAULT
-              : VPREC_RANGE_BINARY32_DEFAULT;
+          (type == FDOUBLE || type == FDOUBLE_PTR) ? function_inst->OpsRange64
+                                                   : function_inst->OpsRange32;
       function_inst->output_args[i].mantissa_length =
-          (type == FDOUBLE || type == FDOUBLE_PTR)
-              ? VPREC_PRECISION_BINARY64_DEFAULT
-              : VPREC_PRECISION_BINARY32_DEFAULT;
+          (type == FDOUBLE || type == FDOUBLE_PTR) ? function_inst->OpsPrec64
+                                                   : function_inst->OpsPrec32;
       function_inst->output_args[i].min_range = INT_MAX;
       function_inst->output_args[i].max_range = INT_MIN;
     }
 
     if (type == FDOUBLE) {
       double *value = va_arg(ap, double *);
+      char data[sizeof(value)];
+      memcpy(data, &value, sizeof(data));
+      double value_orig = (double)atof(data);
 
       _vprec_print_log(vprec_log_depth, " - %s\toutput\tdouble\t%s\t%la\t->\t",
                        function_inst->id, arg_id, *value);
@@ -1130,8 +1251,20 @@ void _interflop_exit_function(interflop_function_stack_t *stack, void *context,
       _vprec_print_log(vprec_log_depth, "%la\t(%d,%d)\n", *value,
                        function_inst->output_args[i].mantissa_length,
                        function_inst->output_args[i].exponent_length);
+      if (vprec_csv != NULL) {
+        if (*value != value_orig) {
+          _vprec_print_csv(vprec_csv_file, "%i;%lu;2;%i;%i;%s;%la;%la;%d;%d\n",
+                           function_inst->vid, vprec_log_depth, VPRECLIB_MODE,
+                           type, arg_id, value_orig, *value,
+                           function_inst->output_args[i].mantissa_length,
+                           function_inst->output_args[i].exponent_length);
+        }
+      }
     } else if (type == FFLOAT) {
       float *value = va_arg(ap, float *);
+      char data[sizeof(value)];
+      memcpy(data, &value, sizeof(data));
+      float value_orig = (float)atof(data);
 
       _vprec_print_log(vprec_log_depth, " - %s\toutput\tfloat\t%s\t%a\t->\t",
                        function_inst->id, arg_id, *value);
@@ -1158,8 +1291,21 @@ void _interflop_exit_function(interflop_function_stack_t *stack, void *context,
       _vprec_print_log(vprec_log_depth, "%a\t(%d, %d)\n", *value,
                        function_inst->output_args[i].mantissa_length,
                        function_inst->output_args[i].exponent_length);
+
+      if (vprec_csv != NULL) {
+        if (*value != value_orig) {
+          _vprec_print_csv(vprec_csv_file, "%i;%lu;2;%i;%i;%s;%a;%a;%d;%d\n",
+                           function_inst->vid, vprec_log_depth, VPRECLIB_MODE,
+                           type, arg_id, value_orig, *value,
+                           function_inst->output_args[i].mantissa_length,
+                           function_inst->output_args[i].exponent_length);
+        }
+      }
     } else if (type == FDOUBLE_PTR) {
       double *value = va_arg(ap, double *);
+      char data[sizeof(value)];
+      memcpy(data, &value, sizeof(data));
+      double value_orig = (double)atof(data);
 
       for (unsigned int j = 0; j < size; j++, value++) {
         if (value == NULL) {
@@ -1167,6 +1313,11 @@ void _interflop_exit_function(interflop_function_stack_t *stack, void *context,
               vprec_log_depth,
               " - %s\toutput[%u]\tdouble_ptr\t%s\tNULL\t->\tNULL\n",
               function_inst->id, j, arg_id);
+          if (vprec_csv != NULL) {
+            _vprec_print_csv(vprec_csv_file, "%i;%lu;2;%i;%i;%s;NULL;NULL\n",
+                             function_inst->vid, vprec_log_depth, VPRECLIB_MODE,
+                             type, arg_id);
+          }
           continue;
         }
 
@@ -1196,15 +1347,33 @@ void _interflop_exit_function(interflop_function_stack_t *stack, void *context,
         _vprec_print_log(vprec_log_depth, "%la\t(%d,%d)\n", *value,
                          function_inst->output_args[i].mantissa_length,
                          function_inst->output_args[i].exponent_length);
+        if (vprec_csv != NULL) {
+          if (*value != value_orig) {
+            _vprec_print_csv(vprec_csv_file,
+                             "%i;%lu;2;%i;%i;%s;%la;%la;%d;%d\n",
+                             function_inst->vid, vprec_log_depth, VPRECLIB_MODE,
+                             type, arg_id, value_orig, *value,
+                             function_inst->output_args[i].mantissa_length,
+                             function_inst->output_args[i].exponent_length);
+          }
+        }
       }
     } else if (type == FFLOAT_PTR) {
       float *value = va_arg(ap, float *);
+      char data[sizeof(value)];
+      memcpy(data, &value, sizeof(data));
+      float value_orig = (float)atof(data);
 
       for (unsigned int j = 0; j < size; j++, value++) {
         if (value == NULL) {
           _vprec_print_log(vprec_log_depth,
                            " - %s\toutput[%u]\tfloat_ptr\t%s\tNULL\t->\tNULL\n",
                            function_inst->id, j, arg_id);
+          if (vprec_csv != NULL) {
+            _vprec_print_csv(vprec_csv_file, "%i;%lu;2;%i;%i;%s;NULL;NULL\n",
+                             function_inst->vid, vprec_log_depth, VPRECLIB_MODE,
+                             type, arg_id);
+          }
           continue;
         }
 
@@ -1234,6 +1403,15 @@ void _interflop_exit_function(interflop_function_stack_t *stack, void *context,
         _vprec_print_log(vprec_log_depth, "%a\t(%d, %d)\n", *value,
                          function_inst->output_args[i].mantissa_length,
                          function_inst->output_args[i].exponent_length);
+        if (vprec_csv != NULL) {
+          if (*value != value_orig) {
+            _vprec_print_csv(vprec_csv_file, "%i;%lu;2;%i;%i;%s;%a;%a;%d;%d\n",
+                             function_inst->vid, vprec_log_depth, VPRECLIB_MODE,
+                             type, arg_id, value_orig, *value,
+                             function_inst->output_args[i].mantissa_length,
+                             function_inst->output_args[i].exponent_length);
+          }
+        }
       }
     }
   }
@@ -1298,6 +1476,8 @@ static struct argp_option options[] = {
      "output file where the precision profile is written", 0},
     {key_log_file_str, KEY_LOG_FILE, "LOG", 0,
      "log file where input/output informations are written", 0},
+    {key_csv_file_str, KEY_CSV_FILE, "CSV", 0,
+     "path to where csv information is written", 0},
     {key_preset_str, KEY_PRESET, "PRESET", 0,
      "select a default PRESET setting among {binary16, binary32, binary64, "
      "bfloat16, tensorfloat, fp24, PXR24}\n"
@@ -1405,6 +1585,9 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
   case KEY_LOG_FILE:
     /* log file */
     _set_vprec_log_file(arg);
+    break;
+  case KEY_CSV_FILE:
+    _set_vprec_csv_file(arg);
     break;
   case KEY_MODE:
     /* mode */
@@ -1572,13 +1755,27 @@ void print_information_header(void *context) {
 
 void _interflop_finalize(__attribute__((unused)) void *context) {
   /* save the hashmap */
-  if (vprec_output_file != NULL) {
+  if (vprec_output_file != NULL && vprec_csv_callpath != NULL) {
+    FILE *f = fopen(vprec_output_file, "w");
+    if (f != NULL && vprec_csv_callpath_file != NULL) {
+      _vprec_write_hasmap(f, vprec_csv_callpath_file);
+      fclose(f);
+    } else {
+      logger_error("Output file and csv can't be written");
+    }
+  } else if (vprec_output_file != NULL && vprec_csv_callpath == NULL) {
     FILE *f = fopen(vprec_output_file, "w");
     if (f != NULL) {
-      _vprec_write_hasmap(f);
+      _vprec_write_hasmap(f, NULL);
       fclose(f);
     } else {
       logger_error("Output file can't be written");
+    }
+  } else if (vprec_csv_callpath != NULL && vprec_output_file == NULL) {
+    if (vprec_csv_callpath_file != NULL) {
+      _vprec_write_hasmap(NULL, vprec_csv_callpath_file);
+    } else {
+      logger_error("CSV file can't be written");
     }
   }
 
@@ -1586,7 +1783,12 @@ void _interflop_finalize(__attribute__((unused)) void *context) {
   if (vprec_log_file != NULL) {
     fclose(vprec_log_file);
   }
-
+  if (vprec_csv_callpath_file != NULL) {
+    fclose(vprec_csv_callpath_file);
+  }
+  if (vprec_csv_file != NULL) {
+    fclose(vprec_csv_file);
+  }
   /* free vprec_function_map */
   vfc_hashmap_free(_vprec_func_map);
 
